@@ -1,0 +1,7 @@
+torch
+numpy
+pytest>=6.0
+mpi4py
+
+
+

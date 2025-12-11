@@ -1,0 +1,29 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "wheel",
+    "cmake>=3.18",
+    "torch",
+    "pybind11>=2.10",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddlp"
+version = "0.1.0"
+description = "Distributed Deep Learning Primitives"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Samuel Nordmann", email = "snordmann@nvidia.com"},
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "mpi4py",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=6.0"]
+
