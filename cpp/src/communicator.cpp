@@ -37,6 +37,14 @@ void CommunicatorImpl::barrier() {
     MPI_Barrier(MPI_COMM_WORLD);
 }
 
+void CommunicatorImpl::finalize() {
+    int finalized = 0;
+    MPI_Finalized(&finalized);
+    if (!finalized) {
+        MPI_Finalize();
+    }
+}
+
 } // namespace ddlp
 
 

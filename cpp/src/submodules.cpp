@@ -2,6 +2,7 @@
 #include "ddlp/primitives/row_parallel.hpp"
 #include "ddlp/primitives/col_parallel.hpp"
 #include "ddlp/primitives/moe.hpp"
+#include "ddlp/primitives/linear_columnwise.hpp"
 #include "ddlp/communicator.hpp"
 
 namespace ddlp {
@@ -26,6 +27,10 @@ void bind_primitives(py::module_& m) {
     py::class_<MixtureOfExpertsImpl>(prim, "MixtureOfExpertsImpl")
         .def(py::init<int64_t, int64_t>())
         .def("forward", &MixtureOfExpertsImpl::forward);
+
+    py::class_<LinearColumnwiseImpl>(prim, "LinearColumnwiseImpl")
+        .def(py::init<int64_t, int64_t>())
+        .def("forward", &LinearColumnwiseImpl::forward);
 }
 
 void bind_communicator(py::module_& m) {
@@ -35,7 +40,8 @@ void bind_communicator(py::module_& m) {
         .def(py::init<>())
         .def("rank", &CommunicatorImpl::rank)
         .def("world_size", &CommunicatorImpl::world_size)
-        .def("barrier", &CommunicatorImpl::barrier);
+        .def("barrier", &CommunicatorImpl::barrier)
+        .def("finalize", &CommunicatorImpl::finalize);
 }
 
 } // namespace ddlp

@@ -21,6 +21,7 @@ set(DDLP_SOURCES
     cpp/src/communicator.cpp
     cpp/src/submodules.cpp
     cpp/src/primitives/col_parallel.cpp
+    cpp/src/primitives/linear_columnwise.cpp
     cpp/src/primitives/moe.cpp
     cpp/src/primitives/row_parallel.cpp
 )

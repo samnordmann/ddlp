@@ -1,6 +1,7 @@
 from torch import nn
 import torch
 import ddlp._C.primitives as _cpp_primitives
+from .linear_columnwise import LinearColumnwise
 
 class SPTPRowParallelLinear(nn.Module):
     """

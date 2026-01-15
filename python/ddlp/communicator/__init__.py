@@ -16,3 +16,6 @@ class Communicator:
     
     def barrier(self):
         self._impl.barrier()
+
+    def finalize(self):
+        self._impl.finalize()

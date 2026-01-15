@@ -12,6 +12,7 @@ public:
     int rank() const;
     int world_size() const;
     void barrier();
+    void finalize();
 
 private:
     int rank_;
