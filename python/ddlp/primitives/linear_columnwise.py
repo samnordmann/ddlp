@@ -9,8 +9,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-import ddlp._C.primitives as _cpp_primitives
-from ddlp.communicator import Communicator
 
 
 @dataclass
@@ -34,8 +32,7 @@ def _get_dist_context(backend: str, process_group: Optional[torch.distributed.Pr
         world_size = torch.distributed.get_world_size(process_group)
         return _DistContext(rank=rank, world_size=world_size, process_group=process_group)
 
-    comm = Communicator()
-    return _DistContext(rank=comm.rank(), world_size=comm.world_size(), process_group=None)
+    raise ValueError(f"LinearColumnwise: unsupported backend '{backend}'")
 
 
 class _PytorchBackend:
@@ -55,13 +52,78 @@ class _PytorchBackend:
         return torch.cat(gathered_out, dim=-1)
 
 
-class _FuserBackend(_PytorchBackend):
+class _FuserBackend:
     def __init__(self, process_group: Optional[torch.distributed.ProcessGroup]):
-        super().__init__(process_group)
+        self.process_group = process_group
         try:
-            torch._C._jit_set_nvfuser_enabled(True)
-        except Exception:
-            pass
+            import nvfuser_direct as nvfuser
+            from nvfuser_direct import CommunicatorBackend, FusionDefinition, ParallelType
+            from nvfuser_direct.pytorch_utils import torch_dtype_to_nvfuser_dtype
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "LinearColumnwise: fuser backend requested but nvfuser_direct is not available"
+            ) from exc
+        self._nvfuser = nvfuser
+        self._CommunicatorBackend = CommunicatorBackend
+        self._FusionDefinition = FusionDefinition
+        self._ParallelType = ParallelType
+        self._torch_dtype_to_nvfuser_dtype = torch_dtype_to_nvfuser_dtype
+        self._executor_cache = {}
+
+    def _get_executor(self, dtype: torch.dtype, m: int, k: int, n: int, world_size: int):
+        key = (dtype, m, k, n, world_size)
+        if key in self._executor_cache:
+            return self._executor_cache[key]
+
+        nvfuser = self._nvfuser
+        FusionDefinition = self._FusionDefinition
+        ParallelType = self._ParallelType
+        torch_dtype_to_nvfuser_dtype = self._torch_dtype_to_nvfuser_dtype
+
+        class _AgMatmulFusion(FusionDefinition):
+            def __init__(self, dtype: torch.dtype, m: int, k: int, n: int, world_size: int):
+                super().__init__()
+                self.dtype = dtype
+                self.m = m
+                self.k = k
+                self.n = n
+                self._world_size = world_size
+
+            def definition(self) -> None:
+                self.A = self.define_tensor(
+                    shape=[self._world_size, self.m // self._world_size, self.k],
+                    contiguity=True,
+                    dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
+                )
+                self.B = self.define_tensor(
+                    shape=[self.k, self.n],
+                    contiguity=True,
+                    dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
+                )
+                self.C = self.ops.matmul(self.A, self.B)
+                self.add_output(self.C)
+
+            def multidevice_schedule(self) -> None:
+                mesh = nvfuser.multidevice.DeviceMesh(range(self._world_size))
+                for tv in [self.A, self.B, self.C]:
+                    tv.set_device_mesh(mesh)
+                self.A.axis(0).parallelize(ParallelType.mesh_x)
+
+        fusion = _AgMatmulFusion(dtype, m, k, n, world_size)
+        with fusion:
+            fusion.definition()
+            fusion.multidevice_schedule()
+        params = nvfuser.multidevice.MultiDeviceExecutorParams()
+        params.backend_type = self._CommunicatorBackend.nccl
+        params.use_allocation_cache = True
+        executor = nvfuser.multidevice.MultiDeviceExecutor(fusion.fusion, params)
+        self._executor_cache[key] = executor
+        return executor
+
+    def _get_rank(self) -> int:
+        if self.process_group is None:
+            return torch.distributed.get_rank()
+        return torch.distributed.get_rank(self.process_group)
 
     def forward(
         self,
@@ -70,21 +132,22 @@ class _FuserBackend(_PytorchBackend):
         bias: Optional[torch.Tensor],
         world_size: int,
     ) -> torch.Tensor:
-        return super().forward(input, weight, bias, world_size)
-
-
-class _CppBackend:
-    def __init__(self, in_features: int, out_features: int):
-        self.impl = _cpp_primitives.LinearColumnwiseImpl(in_features, out_features)
-
-    def forward(
-        self,
-        input: torch.Tensor,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor],
-        world_size: int,
-    ) -> torch.Tensor:
-        return self.impl.forward(input, weight, bias)
+        if bias is not None:
+            raise RuntimeError("LinearColumnwise: fuser backend does not support bias yet")
+        input_2d = input.reshape(-1, input.shape[-1])
+        m = input_2d.shape[0]
+        if m % world_size != 0:
+            raise ValueError("LinearColumnwise: m must be divisible by world_size for fuser backend")
+        rank = self._get_rank()
+        input_sharded = (
+            input_2d.view(world_size, m // world_size, input_2d.shape[1])[rank : rank + 1]
+            .contiguous()
+        )
+        weight_t = weight.t().contiguous()
+        executor = self._get_executor(input.dtype, m, input_2d.shape[1], weight_t.shape[1], world_size)
+        output = executor.run([input_sharded, weight_t])[0]
+        output = output.reshape(output.shape[0] * output.shape[1], output.shape[2])
+        return output.reshape(*input.shape[:-1], output.shape[-1])
 
 
 class _TransformerEngineBackend:
@@ -171,8 +234,6 @@ class LinearColumnwise(nn.Module):
                 self.bias,
                 self._dist.process_group,
             )
-        elif self.backend == "cpp":
-            self._backend = _CppBackend(in_features, out_features)
         else:
             raise ValueError(f"LinearColumnwise: unsupported backend '{self.backend}'")
 
@@ -181,6 +242,10 @@ class LinearColumnwise(nn.Module):
         if not torch.cuda.is_available():
             return False
         if not hasattr(torch._C, "_jit_set_nvfuser_enabled"):
+            return False
+        try:
+            import nvfuser_direct  # noqa: F401
+        except Exception:
             return False
         try:
             torch._C._jit_set_nvfuser_enabled(True)
