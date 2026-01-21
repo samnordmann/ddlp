@@ -178,7 +178,7 @@ class _TransformerEngineBackend:
     def __init__(
         self,
         in_features: int,
-        local_out_features: int,
+        out_features: int,
         bias: bool,
         weight: nn.Parameter,
         bias_param: Optional[nn.Parameter],
@@ -190,11 +190,59 @@ class _TransformerEngineBackend:
             raise RuntimeError(
                 "LinearColumnwise: transformer_engine backend requested but not available"
             ) from exc
+        self._te = te
         self.process_group = process_group
-        self.linear = te.Linear(in_features, local_out_features, bias=bias)
+        self._world_size = torch.distributed.get_world_size(process_group)
+        self._rank = torch.distributed.get_rank(process_group)
+        self._device = weight.device
+        self._bias_enabled = bias
+        self._ub_shape = None
+        self._tp_group = process_group if process_group is not None else torch.distributed.group.WORLD
+        self._ub_name = "qkv"
+        self.linear = te.Linear(
+            in_features,
+            out_features,
+            bias=bias,
+            device=self._device,
+            params_dtype=weight.dtype,
+            sequence_parallel=True,
+            parallel_mode="column",
+            tp_group=self._tp_group,
+            ub_overlap_ag=True,
+            tp_size=self._world_size,
+            ub_name=self._ub_name,
+        )
+        if hasattr(self.linear, "set_tensor_parallel_group"):
+            self.linear.set_tensor_parallel_group(self._tp_group)
+        if self.linear.weight.shape != weight.shape:
+            raise RuntimeError(
+                "LinearColumnwise: transformer_engine weight shape mismatch with module weight"
+            )
         self.linear.weight = weight
         if bias:
+            if self.linear.bias.shape != bias_param.shape:
+                raise RuntimeError(
+                    "LinearColumnwise: transformer_engine bias shape mismatch with module bias"
+                )
             self.linear.bias = bias_param
+
+    def _ensure_ub(self, m: int, k: int, dtype: torch.dtype) -> None:
+        if self._ub_shape == (m, k):
+            return
+        if self._ub_shape is not None:
+            try:
+                self._te.module.base.destroy_ub()
+            except Exception:
+                pass
+        self._te.module.base.initialize_ub(
+            shape=[m, k],
+            tp_size=self._world_size,
+            use_fp8=False,
+            dtype=dtype,
+            ub_cfgs=None,
+            bootstrap_backend="nccl",
+        )
+        self._ub_shape = (m, k)
 
     def forward(
         self,
@@ -203,10 +251,31 @@ class _TransformerEngineBackend:
         bias: Optional[torch.Tensor],
         world_size: int,
     ) -> torch.Tensor:
-        local_out = self.linear(input)
-        gathered_out = [torch.empty_like(local_out) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_out, local_out, group=self.process_group)
-        return torch.cat(gathered_out, dim=-1)
+        input_2d = input.reshape(-1, input.shape[-1])
+        m = input_2d.shape[0]
+        if m % world_size != 0:
+            raise ValueError("LinearColumnwise: m must be divisible by world_size for TE backend")
+        self._ensure_ub(m, input_2d.shape[1], input.dtype)
+        input_sharded = (
+            input_2d.view(world_size, m // world_size, input_2d.shape[1])[self._rank : self._rank + 1]
+            .contiguous()
+        )
+        input_sharded = input_sharded.reshape(m // world_size, input_2d.shape[1])
+        local_out = self.linear(input_sharded)
+        if local_out.shape[0] == m:
+            gathered_out = [torch.empty_like(local_out) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_out, local_out, group=self.process_group)
+            full_out = torch.cat(gathered_out, dim=-1)
+        elif local_out.shape[0] == m // world_size:
+            gathered_seq = [torch.empty_like(local_out) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_seq, local_out, group=self.process_group)
+            seq_full = torch.cat(gathered_seq, dim=0)
+            gathered_feat = [torch.empty_like(seq_full) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered_feat, seq_full, group=self.process_group)
+            full_out = torch.cat(gathered_feat, dim=-1)
+        else:
+            raise RuntimeError("LinearColumnwise: unexpected TE output shape for reconstruction")
+        return full_out.reshape(*input.shape[:-1], full_out.shape[-1])
 
 
 class LinearColumnwise(nn.Module):
