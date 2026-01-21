@@ -70,8 +70,10 @@ class _FuserBackend:
         self._torch_dtype_to_nvfuser_dtype = torch_dtype_to_nvfuser_dtype
         self._executor_cache = {}
 
-    def _get_executor(self, dtype: torch.dtype, m: int, k: int, n: int, world_size: int):
-        key = (dtype, m, k, n, world_size)
+    def _get_executor(
+        self, dtype: torch.dtype, m: int, k: int, n: int, world_size: int, has_bias: bool
+    ):
+        key = (dtype, m, k, n, world_size, has_bias)
         if key in self._executor_cache:
             return self._executor_cache[key]
 
@@ -80,14 +82,17 @@ class _FuserBackend:
         ParallelType = self._ParallelType
         torch_dtype_to_nvfuser_dtype = self._torch_dtype_to_nvfuser_dtype
 
-        class _AgMatmulFusion(FusionDefinition):
-            def __init__(self, dtype: torch.dtype, m: int, k: int, n: int, world_size: int):
+        class _AgLinearFusion(FusionDefinition):
+            def __init__(
+                self, dtype: torch.dtype, m: int, k: int, n: int, world_size: int, has_bias: bool
+            ):
                 super().__init__()
                 self.dtype = dtype
                 self.m = m
                 self.k = k
                 self.n = n
                 self._world_size = world_size
+                self._has_bias = has_bias
 
             def definition(self) -> None:
                 self.A = self.define_tensor(
@@ -96,20 +101,31 @@ class _FuserBackend:
                     dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
                 )
                 self.B = self.define_tensor(
-                    shape=[self.k, self.n],
+                    shape=[self.n, self.k],
                     contiguity=True,
                     dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
                 )
-                self.C = self.ops.matmul(self.A, self.B)
+                if self._has_bias:
+                    self.Bias = self.define_tensor(
+                        shape=[self.n],
+                        contiguity=True,
+                        dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
+                    )
+                    self.C = self.ops.linear(self.A, self.B, self.Bias)
+                else:
+                    self.C = self.ops.linear(self.A, self.B)
                 self.add_output(self.C)
 
             def multidevice_schedule(self) -> None:
                 mesh = nvfuser.multidevice.DeviceMesh(range(self._world_size))
-                for tv in [self.A, self.B, self.C]:
+                tensor_views = [self.A, self.B, self.C]
+                if self._has_bias:
+                    tensor_views.append(self.Bias)
+                for tv in tensor_views:
                     tv.set_device_mesh(mesh)
                 self.A.axis(0).parallelize(ParallelType.mesh_x)
 
-        fusion = _AgMatmulFusion(dtype, m, k, n, world_size)
+        fusion = _AgLinearFusion(dtype, m, k, n, world_size, has_bias)
         with fusion:
             fusion.definition()
             fusion.multidevice_schedule()
@@ -132,8 +148,6 @@ class _FuserBackend:
         bias: Optional[torch.Tensor],
         world_size: int,
     ) -> torch.Tensor:
-        if bias is not None:
-            raise RuntimeError("LinearColumnwise: fuser backend does not support bias yet")
         input_2d = input.reshape(-1, input.shape[-1])
         m = input_2d.shape[0]
         if m % world_size != 0:
@@ -143,9 +157,19 @@ class _FuserBackend:
             input_2d.view(world_size, m // world_size, input_2d.shape[1])[rank : rank + 1]
             .contiguous()
         )
-        weight_t = weight.t().contiguous()
-        executor = self._get_executor(input.dtype, m, input_2d.shape[1], weight_t.shape[1], world_size)
-        output = executor.run([input_sharded, weight_t])[0]
+        weight_c = weight.contiguous()
+        executor = self._get_executor(
+            input.dtype,
+            m,
+            input_2d.shape[1],
+            weight_c.shape[0],
+            world_size,
+            bias is not None,
+        )
+        inputs = [input_sharded, weight_c]
+        if bias is not None:
+            inputs.append(bias.contiguous())
+        output = executor.run(inputs)[0]
         output = output.reshape(output.shape[0] * output.shape[1], output.shape[2])
         return output.reshape(*input.shape[:-1], output.shape[-1])
 
@@ -209,9 +233,12 @@ class LinearColumnwise(nn.Module):
         self.backend = self._select_backend(backend)
 
         self._dist = _get_dist_context(self.backend, process_group)
-        if out_features % self._dist.world_size != 0:
-            raise ValueError("LinearColumnwise: out_features must be divisible by world_size")
-        self.local_out_features = out_features // self._dist.world_size
+        if self.backend == "fuser":
+            self.local_out_features = out_features
+        else:
+            if out_features % self._dist.world_size != 0:
+                raise ValueError("LinearColumnwise: out_features must be divisible by world_size")
+            self.local_out_features = out_features // self._dist.world_size
 
         factory_kwargs = {"device": device, "dtype": dtype}
         self.weight = nn.Parameter(torch.empty(self.local_out_features, in_features, **factory_kwargs))
@@ -228,7 +255,7 @@ class LinearColumnwise(nn.Module):
         elif self.backend == "transformer_engine":
             self._backend = _TransformerEngineBackend(
                 in_features,
-                self.local_out_features,
+                out_features,
                 bias,
                 self.weight,
                 self.bias,
@@ -241,14 +268,8 @@ class LinearColumnwise(nn.Module):
     def _is_fuser_available() -> bool:
         if not torch.cuda.is_available():
             return False
-        if not hasattr(torch._C, "_jit_set_nvfuser_enabled"):
-            return False
         try:
             import nvfuser_direct  # noqa: F401
-        except Exception:
-            return False
-        try:
-            torch._C._jit_set_nvfuser_enabled(True)
         except Exception:
             return False
         return True
