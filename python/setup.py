@@ -2,6 +2,8 @@ import os
 import re
 import subprocess
 import sys
+import shutil
+from multiprocessing import cpu_count
 from pathlib import Path
 
 from setuptools import Extension, setup, find_packages
@@ -51,6 +53,9 @@ class CMakeBuild(build_ext):
             f"-DPYTHON_EXECUTABLE={sys.executable}",
             f"-DCMAKE_BUILD_TYPE={cfg}",  # not used on MSVC, but no harm
         ]
+        if not cmake_generator and self.compiler.compiler_type != "msvc" and shutil.which("ninja"):
+            # Ninja is the most common fast default for local CMake builds.
+            cmake_args += ["-G", "Ninja"]
         
         # Add Torch cmake path if available
         if torch_cmake_path:
@@ -87,6 +92,9 @@ class CMakeBuild(build_ext):
             if hasattr(self, "parallel") and self.parallel:
                 # CMake 3.12+ only.
                 build_args += [f"-j{self.parallel}"]
+            else:
+                # Default to all available cores for editable installs.
+                os.environ["CMAKE_BUILD_PARALLEL_LEVEL"] = str(cpu_count())
 
         if not os.path.exists(self.build_temp):
             os.makedirs(self.build_temp)
