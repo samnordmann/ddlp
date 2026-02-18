@@ -3,12 +3,3 @@ code = 'FLAKE8'
 include_patterns = ['**/*.py']
 exclude_patterns = ['.git/**', '__pycache__/**', 'build/**', 'dist/**']
 command = ['flake8', '--max-line-length=120', '@{path}']
-
-[[linter]]
-code = 'CLANGFORMAT'
-include_patterns = ['**/*.h', '**/*.c', '**/*.hpp', '**/*.cpp', '**/*.cu', '**/*.cuh']
-exclude_patterns = ['build/**']
-command = ['clang-format', '-i', '@{path}']
-
-
-

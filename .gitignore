@@ -1,8 +1,4 @@
 __pycache__/
-*.so
-*.dylib
-*.pyd
-*.dll
 build/
 dist/
 *.egg-info/
@@ -12,7 +8,4 @@ htmlcov/
 *.swp
 .DS_Store
 .vscode/
-compile_commands.json
 .cursor*
-
-

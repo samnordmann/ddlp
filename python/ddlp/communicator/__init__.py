@@ -1,21 +1,17 @@
-import ddlp._C.communicator as _cpp_communicator
+import torch.distributed as dist
+
 
 class Communicator:
-    """
-    DDLP Communicator Component.
-    Gathers MPI/Distributed info and manages backend communication contexts.
-    """
-    def __init__(self):
-        self._impl = _cpp_communicator.CommunicatorImpl()
-    
-    def rank(self):
-        return self._impl.rank()
-        
-    def world_size(self):
-        return self._impl.world_size()
-    
-    def barrier(self):
-        self._impl.barrier()
+    """Thin wrapper around torch.distributed for rank/world_size/barrier."""
 
-    def finalize(self):
-        self._impl.finalize()
+    def __init__(self, process_group=None):
+        self._pg = process_group
+
+    def rank(self):
+        return dist.get_rank(self._pg)
+
+    def world_size(self):
+        return dist.get_world_size(self._pg)
+
+    def barrier(self):
+        dist.barrier(group=self._pg)

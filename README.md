@@ -1,41 +1,46 @@
 # DDLP: Distributed Deep Learning Primitives
 
-DDLP is a high-performance, research-oriented library providing "speed-of-light" distributed primitives for deep learning on NVIDIA hardware. It focuses on maximizing communication/computation overlap using compiler-driven optimizations (via nvFuser) and hardware-specific features (Copy Engines, NVLink, NVLS).
+DDLP is a lightweight, pure-Python library providing fused communication/computation primitives for distributed deep learning on NVIDIA GPUs.
 
-## Mission
+## Primitive
 
-To enable deep exploration of the performance space for distributed primitives by treating communication and computation as a unified, fused pipeline.
-
-## Features
-
-- **Supported Primitives**:
-  - `SP-TP-ColumnParallelLinear`: AllGather + Linear
-- **Backend**: Primary backend leveraging **nvFuser** for host-initiated, zero-SM communication pipelines.
-
-- **Target Primitives**:
-  - `SP-TP-RowParallelLinear`: Linear + ReduceScatter
-  - `TP-RowParallelLinear`: Linear + AllReduce
-  - `MixtureOfExperts`: Dispatch, Routing, and Combine
+- **`LinearColumnwise`**: Tensor-parallel column-wise linear layer (local GEMM + AllGather). Supports three backends:
+  - `pytorch` -- pure PyTorch (`F.linear` + `torch.distributed.all_gather`)
+  - `fuser` -- nvFuser-accelerated (requires `nvfuser_direct`)
+  - `transformer_engine` -- Transformer Engine integration (requires `transformer_engine`)
 
 ## Installation
 
 ```bash
-pip install -v -e ./python
+pip install -e ./python
 ```
 
-## Structure
+Optional backends:
 
-- `python/ddlp`: Python API and bindings.
-- `cpp/`: C++ source implementations and headers.
-- `tests/`: Unit tests.
-- `benchmarks/`: Performance benchmarks (referencing DDLB).
+```bash
+pip install -e "./python[fuser]"        # nvFuser backend
+pip install -e "./python[te]"           # Transformer Engine backend
+```
+
+## Usage
+
+```python
+import torch
+import torch.distributed as dist
+from ddlp.primitives import LinearColumnwise
+
+dist.init_process_group(backend="nccl")
+model = LinearColumnwise(in_features=1024, out_features=4096, backend="pytorch", device="cuda")
+output = model(torch.randn(2, 128, 1024, device="cuda"))
+```
+
+## Testing
+
+```bash
+torchrun --nproc_per_node=<N> tests/test_linear_columnwise.py
+```
 
 ## Dependencies
 
-- PyTorch
-- CUDA Toolkit
-- MPI (Optional, for Communicator)
-- nvFuser (Internal dependency)
-
-
-
+- **Required:** PyTorch (with CUDA and `torch.distributed`)
+- **Optional:** `nvfuser_direct` (fuser backend), `transformer_engine` (TE backend)
