@@ -8,13 +8,14 @@ To enable deep exploration of the performance space for distributed primitives b
 
 ## Features
 
-- **Standard Primitives**:
-  - `SP-TP-RowParallelLinear`: Linear + ReduceScatter
+- **Supported Primitives**:
   - `SP-TP-ColumnParallelLinear`: AllGather + Linear
+- **Backend**: Primary backend leveraging **nvFuser** for host-initiated, zero-SM communication pipelines.
+
+- **Target Primitives**:
+  - `SP-TP-RowParallelLinear`: Linear + ReduceScatter
   - `TP-RowParallelLinear`: Linear + AllReduce
   - `MixtureOfExperts`: Dispatch, Routing, and Combine
-- **Backend**: Primary backend leveraging **nvFuser** for host-initiated, zero-SM communication pipelines.
-- **Architecture**: Hybrid Python/C++ design with standard PyTorch tensor I/O.
 
 ## Installation
 
