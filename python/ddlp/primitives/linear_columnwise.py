@@ -5,10 +5,14 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import math
+import os
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .heuristics import Heuristic, DEFAULT_HEURISTIC
+
+_DDLP_DEBUG = os.environ.get("DDLP_DEBUG", "0") == "1"
 
 
 @dataclass
@@ -19,7 +23,7 @@ class _DistContext:
 
 
 def _backend_uses_torch_dist(backend: str) -> bool:
-    return backend in ("pytorch", "fuser", "transformer_engine")
+    return backend in ("auto", "pytorch", "fuser", "transformer_engine")
 
 
 def _get_dist_context(backend: str, process_group: Optional[torch.distributed.ProcessGroup]) -> _DistContext:
@@ -285,10 +289,11 @@ class LinearColumnwise(nn.Module):
         in_features: int,
         out_features: int,
         bias: bool = True,
-        backend: str = "fuser",
+        backend: str = "auto",
         process_group: Optional[torch.distributed.ProcessGroup] = None,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
+        heuristic: Optional[Heuristic] = None,
         options: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
@@ -296,8 +301,15 @@ class LinearColumnwise(nn.Module):
             raise ValueError("LinearColumnwise: only CUDA devices are supported")
         self.in_features = in_features
         self.out_features = out_features
-        self.options = self._resolve_base_options(backend, options or {})
-        self.backend = self.options["backend"]
+        self.backend = backend
+
+        if backend == "auto":
+            self._heuristic = heuristic or DEFAULT_HEURISTIC
+            self.options = {}
+        else:
+            self._heuristic = None
+            self.options = self._resolve_base_options(backend, options or {})
+            self.backend = self.options["backend"]
 
         self._dist = _get_dist_context(self.backend, process_group)
         if out_features % self._dist.world_size != 0:
@@ -312,19 +324,21 @@ class LinearColumnwise(nn.Module):
             self.register_parameter("bias", None)
         self.reset_parameters()
 
-        if self.backend == "pytorch":
-            self._backend = _PytorchBackend(self._dist.process_group)
+        if self.backend == "auto":
+            self._backends = {"pytorch": _PytorchBackend(self._dist.process_group)}
+            if self._is_fuser_available():
+                self._backends["fuser"] = _FuserBackend(self._dist.process_group)
+        elif self.backend == "pytorch":
+            self._backends = {"pytorch": _PytorchBackend(self._dist.process_group)}
         elif self.backend == "fuser":
-            self._backend = _FuserBackend(self._dist.process_group)
+            self._backends = {"fuser": _FuserBackend(self._dist.process_group)}
         elif self.backend == "transformer_engine":
-            self._backend = _TransformerEngineBackend(
-                in_features,
-                out_features,
-                bias,
-                self.weight,
-                self.bias,
-                self._dist.process_group,
-            )
+            self._backends = {
+                "transformer_engine": _TransformerEngineBackend(
+                    in_features, out_features, bias,
+                    self.weight, self.bias, self._dist.process_group,
+                )
+            }
         else:
             raise ValueError(f"LinearColumnwise: unsupported backend '{self.backend}'")
 
@@ -340,8 +354,8 @@ class LinearColumnwise(nn.Module):
 
     @classmethod
     def _select_backend(cls, backend: str) -> str:
-        if backend in ("auto", "fuser"):
-            return "fuser" if cls._is_fuser_available() else "pytorch"
+        if backend == "fuser" and not cls._is_fuser_available():
+            return "pytorch"
         return backend
 
     @classmethod
@@ -351,6 +365,7 @@ class LinearColumnwise(nn.Module):
         resolved["backend"] = cls._select_backend(requested_backend)
         resolved.setdefault("transport", "cuda")
         resolved.setdefault("algorithm", None)
+        resolved.setdefault("multicast_protocol", "default")
         resolved.setdefault("offset_stream_indexing_by_rank", False)
         resolved.setdefault("inter_stream_synchronization", False)
         return resolved
@@ -393,22 +408,34 @@ class LinearColumnwise(nn.Module):
             raise RuntimeError("LinearColumnwise: only CUDA tensors are supported")
         if self.bias is not None and not self.bias.is_cuda:
             raise RuntimeError("LinearColumnwise: bias must be on CUDA")
-        runtime_options = self._resolve_runtime_options(
-            input, self.in_features, self.out_features, self.options
-        )
-        if _backend_uses_torch_dist(self.backend):
-            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-                raise RuntimeError(
-                    "LinearColumnwise: torch.distributed must be initialized for CUDA tensors"
-                )
-            world_size = torch.distributed.get_world_size(self._dist.process_group)
-            if world_size != self._dist.world_size:
-                raise RuntimeError(
-                    "LinearColumnwise: torch.distributed world_size mismatch with module world_size"
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("LinearColumnwise: torch.distributed must be initialized")
+        world_size = torch.distributed.get_world_size(self._dist.process_group)
+        if world_size != self._dist.world_size:
+            raise RuntimeError("LinearColumnwise: world_size mismatch")
+
+        if self._heuristic is not None:
+            m = int(input.numel() // input.shape[-1])
+            config = self._heuristic.select(m, self.in_features, self.local_out_features)
+            backend_key = config.backend
+            if backend_key not in self._backends:
+                backend_key = "pytorch"
+            options = config.to_options()
+            if _DDLP_DEBUG:
+                print(
+                    f"[DDLP] m={m} k={self.in_features} n={self.local_out_features} "
+                    f"-> backend={backend_key} algorithm={config.algorithm} "
+                    f"transport={config.transport} mcast={config.multicast_protocol}"
                 )
         else:
-            world_size = self._dist.world_size
-        if self.backend == "fuser":
-            return self._backend.forward(input, self.weight, self.bias, world_size, runtime_options)
-        return self._backend.forward(input, self.weight, self.bias, world_size)
+            backend_key = self.backend
+            options = self._resolve_runtime_options(
+                input, self.in_features, self.out_features, self.options
+            )
+
+        backend = self._backends[backend_key]
+        if backend_key in ("fuser", "transformer_engine"):
+            return backend.forward(input, self.weight, self.bias, world_size, options)
+        return backend.forward(input, self.weight, self.bias, world_size)
 
