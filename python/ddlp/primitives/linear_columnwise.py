@@ -40,39 +40,47 @@ def _get_dist_context(backend: str, process_group: Optional[torch.distributed.Pr
 
 
 class _PytorchBackend:
-    def __init__(self, process_group: Optional[torch.distributed.ProcessGroup]):
-        self.process_group = process_group
-        self._full_weight: Optional[torch.Tensor] = None
-        self._full_bias: Optional[torch.Tensor] = None
-
-    def forward(
+    def __init__(
         self,
-        input: torch.Tensor,
+        process_group: Optional[torch.distributed.ProcessGroup],
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         world_size: int,
-    ) -> torch.Tensor:
-        if self._full_weight is None or self._full_weight.shape[0] != weight.shape[0] * world_size:
-            self._full_weight = torch.empty(
-                weight.shape[0] * world_size, weight.shape[1],
-                dtype=weight.dtype, device=weight.device,
+    ):
+        self.process_group = process_group
+        self._full_weight = torch.empty(
+            weight.shape[0] * world_size, weight.shape[1],
+            dtype=weight.dtype, device=weight.device,
+        )
+        if bias is not None:
+            self._full_bias = torch.empty(
+                bias.shape[0] * world_size, dtype=bias.dtype, device=bias.device,
             )
-            if bias is not None:
-                self._full_bias = torch.empty(
-                    bias.shape[0] * world_size, dtype=bias.dtype, device=bias.device,
-                )
+            self.forward = self._forward_with_bias
+        else:
+            self._full_bias = None
+            self.forward = self._forward_no_bias
 
+    def _forward_no_bias(
+        self, input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+        world_size: int,
+    ) -> torch.Tensor:
         torch.distributed.all_gather_into_tensor(
             self._full_weight, weight, group=self.process_group,
         )
-        full_bias = None
-        if bias is not None:
-            torch.distributed.all_gather_into_tensor(
-                self._full_bias, bias, group=self.process_group,
-            )
-            full_bias = self._full_bias
+        return F.linear(input, self._full_weight)
 
-        return F.linear(input, self._full_weight, full_bias)
+    def _forward_with_bias(
+        self, input: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+        world_size: int,
+    ) -> torch.Tensor:
+        torch.distributed.all_gather_into_tensor(
+            self._full_weight, weight, group=self.process_group,
+        )
+        torch.distributed.all_gather_into_tensor(
+            self._full_bias, bias, group=self.process_group,
+        )
+        return F.linear(input, self._full_weight, self._full_bias)
 
 
 class _FuserBackend:
@@ -337,12 +345,13 @@ class LinearColumnwise(nn.Module):
             self.register_parameter("bias", None)
         self.reset_parameters()
 
+        pytorch_args = (self._dist.process_group, self.weight, self.bias, self._world_size)
         if self.backend == "auto":
-            self._backends = {"pytorch": _PytorchBackend(self._dist.process_group)}
+            self._backends = {"pytorch": _PytorchBackend(*pytorch_args)}
             if self._is_fuser_available():
                 self._backends["fuser"] = _FuserBackend(self._dist.process_group)
         elif self.backend == "pytorch":
-            self._backends = {"pytorch": _PytorchBackend(self._dist.process_group)}
+            self._backends = {"pytorch": _PytorchBackend(*pytorch_args)}
         elif self.backend == "fuser":
             self._backends = {"fuser": _FuserBackend(self._dist.process_group)}
         elif self.backend == "transformer_engine":
@@ -356,9 +365,7 @@ class LinearColumnwise(nn.Module):
             raise ValueError(f"LinearColumnwise: unsupported backend '{self.backend}'")
 
         self._cached_mkn = (-1, -1, -1)
-        self._cached_backend = None
-        self._cached_options: Dict[str, Any] = {}
-        self._cached_passes_options = False
+        self._cached_call = None
 
     @staticmethod
     def _is_fuser_available() -> bool:
@@ -441,19 +448,17 @@ class LinearColumnwise(nn.Module):
             )
 
         self._cached_mkn = (m, k, n)
-        self._cached_backend = self._backends[backend_key]
-        self._cached_options = options
-        self._cached_passes_options = backend_key in ("fuser", "transformer_engine")
+        backend = self._backends[backend_key]
+        weight, bias, ws = self.weight, self.bias, self._world_size
+        if backend_key in ("fuser", "transformer_engine"):
+            opts = options
+            self._cached_call = lambda inp: backend.forward(inp, weight, bias, ws, opts)
+        else:
+            self._cached_call = lambda inp: backend.forward(inp, weight, bias, ws)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         m = int(input.numel() // input.shape[-1])
         if (m, self.in_features, self.local_out_features) != self._cached_mkn:
             self._resolve_dispatch(m)
-        if self._cached_passes_options:
-            return self._cached_backend.forward(
-                input, self.weight, self.bias, self._world_size, self._cached_options,
-            )
-        return self._cached_backend.forward(
-            input, self.weight, self.bias, self._world_size,
-        )
+        return self._cached_call(input)
 
