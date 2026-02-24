@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Dict
 
 
@@ -16,8 +16,19 @@ class HeuristicConfig:
     offset_stream_indexing_by_rank: bool = False
     inter_stream_synchronization: bool = False
 
+    def __post_init__(self) -> None:
+        opts: Dict[str, Any] = {
+            "backend": self.backend,
+            "algorithm": self.algorithm,
+            "transport": self.transport,
+            "multicast_protocol": self.multicast_protocol,
+            "offset_stream_indexing_by_rank": self.offset_stream_indexing_by_rank,
+            "inter_stream_synchronization": self.inter_stream_synchronization,
+        }
+        object.__setattr__(self, "_options", opts)
+
     def to_options(self) -> Dict[str, Any]:
-        return asdict(self)
+        return self._options  # type: ignore[attr-defined]
 
 
 class Heuristic(ABC):
@@ -69,11 +80,11 @@ class DecisionTreeHeuristic(Heuristic):
 
     def select(self, m: int, k: int, n: int) -> HeuristicConfig:
         # Thresholds fitted with DDLB on a single 8xH100 DGX node; subject to change.
-        mk = m * k
-        if mk <= 25_165_824:
-            if mk <= 6_291_456:
-                return self.FUSER_EAGER_MEMCPY
-            return self.FUSER_EAGER_MULTIMEM if n <= 1536 else self.PYTORCH
+        kn = k * n
+        if kn <= 25_165_824:
+            if kn <= 6_291_456:
+                return self.PYTORCH
+            return self.FUSER_EAGER_MULTIMEM if m <= 1536 else self.PYTORCH
         mnk = m * n * k
         if mnk <= 824_633_720_832:
             return self.FUSER_EAGER_MEMCPY

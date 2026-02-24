@@ -42,6 +42,8 @@ def _get_dist_context(backend: str, process_group: Optional[torch.distributed.Pr
 class _PytorchBackend:
     def __init__(self, process_group: Optional[torch.distributed.ProcessGroup]):
         self.process_group = process_group
+        self._full_weight: Optional[torch.Tensor] = None
+        self._full_bias: Optional[torch.Tensor] = None
 
     def forward(
         self,
@@ -50,15 +52,34 @@ class _PytorchBackend:
         bias: Optional[torch.Tensor],
         world_size: int,
     ) -> torch.Tensor:
-        local_out = F.linear(input, weight, bias)
-        gathered_out = [torch.empty_like(local_out) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_out, local_out, group=self.process_group)
-        return torch.cat(gathered_out, dim=-1)
+        if self._full_weight is None or self._full_weight.shape[0] != weight.shape[0] * world_size:
+            self._full_weight = torch.empty(
+                weight.shape[0] * world_size, weight.shape[1],
+                dtype=weight.dtype, device=weight.device,
+            )
+            if bias is not None:
+                self._full_bias = torch.empty(
+                    bias.shape[0] * world_size, dtype=bias.dtype, device=bias.device,
+                )
+
+        torch.distributed.all_gather_into_tensor(
+            self._full_weight, weight, group=self.process_group,
+        )
+        full_bias = None
+        if bias is not None:
+            torch.distributed.all_gather_into_tensor(
+                self._full_bias, bias, group=self.process_group,
+            )
+            full_bias = self._full_bias
+
+        return F.linear(input, self._full_weight, full_bias)
 
 
 class _FuserBackend:
     def __init__(self, process_group: Optional[torch.distributed.ProcessGroup]):
         self.process_group = process_group
+        self._gather_bufs: Optional[list] = None
+        self._output_buf: Optional[torch.Tensor] = None
         try:
             import nvfuser_direct as nvfuser
             from nvfuser_direct import FusionDefinition
@@ -109,40 +130,30 @@ class _FuserBackend:
                     contiguity=True,
                     dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
                 )
+                # Weight in PyTorch layout [n, k]; permute to [k, n] for matmul
                 self.B = self.define_tensor(
-                    shape=[self.k, self.n],
+                    shape=[self.n, self.k],
                     contiguity=True,
                     dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
                 )
+                B_t = self.ops.permute(self.B, [1, 0])
                 if self._has_bias:
                     self.Bias = self.define_tensor(
                         shape=[self.n],
                         contiguity=True,
                         dtype=torch_dtype_to_nvfuser_dtype(self.dtype),
                     )
-                    self.C_matmul = self.ops.matmul(self.A, self.B)
-                    self.C = self.ops.add(self.C_matmul, self.Bias)
+                    C_matmul = self.ops.matmul(self.A, B_t)
+                    self.C = self.ops.add(C_matmul, self.Bias)
                 else:
-                    self.C_matmul = self.ops.matmul(self.A, self.B)
-                    self.C = self.C_matmul
+                    self.C = self.ops.matmul(self.A, B_t)
                 self.add_output(self.C)
 
-        fusion = _LocalLinearFusion(
-            dtype,
-            m,
-            k,
-            n,
-            has_bias,
-        )
+        fusion = _LocalLinearFusion(dtype, m, k, n, has_bias)
         with fusion:
             fusion.definition()
         self._fusion_cache[key] = fusion
         return fusion
-
-    def _get_rank(self) -> int:
-        if self.process_group is None:
-            return torch.distributed.get_rank()
-        return torch.distributed.get_rank(self.process_group)
 
     def forward(
         self,
@@ -154,23 +165,24 @@ class _FuserBackend:
     ) -> torch.Tensor:
         input_2d = input.reshape(-1, input.shape[-1])
         m = input_2d.shape[0]
-        _ = self._get_rank()
-        weight_t = weight.t().contiguous()
-        inputs = [input_2d.contiguous(), weight_t]
         has_bias = bias is not None
+        inputs = [input_2d, weight]
         if has_bias:
-            inputs.append(bias.contiguous())
+            inputs.append(bias)
         executor = self._get_executor(
-            input.dtype,
-            m,
-            input_2d.shape[1],
-            weight_t.shape[1],
-            has_bias,
+            input.dtype, m, input_2d.shape[1], weight.shape[0], has_bias,
         )
-        local_out = executor.execute(inputs)[0].reshape(*input.shape[:-1], weight.shape[0])
-        gathered_out = [torch.empty_like(local_out) for _ in range(world_size)]
-        torch.distributed.all_gather(gathered_out, local_out, group=self.process_group)
-        return torch.cat(gathered_out, dim=-1)
+        local_out = executor.execute(inputs, use_allocation_cache=True)[0]
+        local_out = local_out.reshape(*input.shape[:-1], weight.shape[0])
+        if self._gather_bufs is None or self._gather_bufs[0].shape != local_out.shape:
+            self._gather_bufs = [torch.empty_like(local_out) for _ in range(world_size)]
+            self._output_buf = None
+        torch.distributed.all_gather(self._gather_bufs, local_out, group=self.process_group)
+        if self._output_buf is not None:
+            torch.cat(self._gather_bufs, dim=-1, out=self._output_buf)
+        else:
+            self._output_buf = torch.cat(self._gather_bufs, dim=-1)
+        return self._output_buf
 
 
 class _TransformerEngineBackend:
@@ -312,9 +324,10 @@ class LinearColumnwise(nn.Module):
             self.backend = self.options["backend"]
 
         self._dist = _get_dist_context(self.backend, process_group)
-        if out_features % self._dist.world_size != 0:
+        self._world_size = self._dist.world_size
+        if out_features % self._world_size != 0:
             raise ValueError("LinearColumnwise: out_features must be divisible by world_size")
-        self.local_out_features = out_features // self._dist.world_size
+        self.local_out_features = out_features // self._world_size
 
         factory_kwargs = {"device": device, "dtype": dtype}
         self.weight = nn.Parameter(torch.empty(self.local_out_features, in_features, **factory_kwargs))
@@ -341,6 +354,11 @@ class LinearColumnwise(nn.Module):
             }
         else:
             raise ValueError(f"LinearColumnwise: unsupported backend '{self.backend}'")
+
+        self._cached_mkn = (-1, -1, -1)
+        self._cached_backend = None
+        self._cached_options: Dict[str, Any] = {}
+        self._cached_passes_options = False
 
     @staticmethod
     def _is_fuser_available() -> bool:
@@ -372,17 +390,14 @@ class LinearColumnwise(nn.Module):
 
     @staticmethod
     def _resolve_runtime_options(
-        input: torch.Tensor, in_features: int, out_features: int, options: Dict[str, Any]
+        m: int, in_features: int, out_features: int, options: Dict[str, Any]
     ) -> Dict[str, Any]:
         resolved = dict(options)
         if resolved.get("backend") != "fuser":
             return resolved
         if resolved.get("algorithm") is not None:
             return resolved
-        m = int(input.numel() // in_features)
-        k = in_features
-        n = out_features
-        mkn = m * k * n
+        mkn = m * in_features * out_features
         # Heuristic thresholds (tuned later): small < 1e8, medium < 1e10, else large
         if mkn < 1e8:
             resolved["algorithm"] = "default"
@@ -403,39 +418,42 @@ class LinearColumnwise(nn.Module):
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.bias, -bound, bound)
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if not input.is_cuda or not self.weight.is_cuda:
-            raise RuntimeError("LinearColumnwise: only CUDA tensors are supported")
-        if self.bias is not None and not self.bias.is_cuda:
-            raise RuntimeError("LinearColumnwise: bias must be on CUDA")
-
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            raise RuntimeError("LinearColumnwise: torch.distributed must be initialized")
-        world_size = torch.distributed.get_world_size(self._dist.process_group)
-        if world_size != self._dist.world_size:
-            raise RuntimeError("LinearColumnwise: world_size mismatch")
-
+    def _resolve_dispatch(self, m: int) -> None:
+        k, n = self.in_features, self.local_out_features
         if self._heuristic is not None:
-            m = int(input.numel() // input.shape[-1])
-            config = self._heuristic.select(m, self.in_features, self.local_out_features)
+            config = self._heuristic.select(m, k, n)
             backend_key = config.backend
             if backend_key not in self._backends:
                 backend_key = "pytorch"
             options = config.to_options()
             if _DDLP_DEBUG:
                 print(
-                    f"[DDLP] m={m} k={self.in_features} n={self.local_out_features} "
+                    f"[DDLP] m={m} k={k} n={n} "
                     f"-> backend={backend_key} algorithm={config.algorithm} "
-                    f"transport={config.transport} mcast={config.multicast_protocol}"
+                    f"transport={config.transport} mcast={config.multicast_protocol} "
+                    f"offset_by_rank={config.offset_stream_indexing_by_rank} "
+                    f"inter_stream_sync={config.inter_stream_synchronization}"
                 )
         else:
             backend_key = self.backend
             options = self._resolve_runtime_options(
-                input, self.in_features, self.out_features, self.options
+                m, self.in_features, self.out_features, self.options
             )
 
-        backend = self._backends[backend_key]
-        if backend_key in ("fuser", "transformer_engine"):
-            return backend.forward(input, self.weight, self.bias, world_size, options)
-        return backend.forward(input, self.weight, self.bias, world_size)
+        self._cached_mkn = (m, k, n)
+        self._cached_backend = self._backends[backend_key]
+        self._cached_options = options
+        self._cached_passes_options = backend_key in ("fuser", "transformer_engine")
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        m = int(input.numel() // input.shape[-1])
+        if (m, self.in_features, self.local_out_features) != self._cached_mkn:
+            self._resolve_dispatch(m)
+        if self._cached_passes_options:
+            return self._cached_backend.forward(
+                input, self.weight, self.bias, self._world_size, self._cached_options,
+            )
+        return self._cached_backend.forward(
+            input, self.weight, self.bias, self._world_size,
+        )
 
