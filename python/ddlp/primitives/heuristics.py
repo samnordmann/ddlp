@@ -42,9 +42,9 @@ class Heuristic(ABC):
         """Return configuration for the given problem dimensions.
 
         Args:
-            m: Number of tokens (batch_size * sequence_length).
-            k: Input features (in_features).
-            n: Local output features per rank (out_features // world_size).
+            m: Local number of rows per rank (m_local = total_rows / world_size).
+            k: Inner dimension (in_features).
+            n: Output features (out_features, replicated).
         """
         ...
 
@@ -80,11 +80,11 @@ class DecisionTreeHeuristic(Heuristic):
 
     def select(self, m: int, k: int, n: int) -> HeuristicConfig:
         # Thresholds fitted with DDLB on a single 8xH100 DGX node; subject to change.
-        kn = k * n
-        if kn <= 25_165_824:
-            if kn <= 6_291_456:
-                return self.PYTORCH
-            return self.FUSER_EAGER_MULTIMEM if m <= 1536 else self.PYTORCH
+        mk = m * k
+        if mk <= 25_165_824:
+            if mk <= 6_291_456:
+                return self.FUSER_EAGER_MULTIMEM
+            return self.FUSER_EAGER_MULTIMEM if n <= 1536 else self.PYTORCH
         mnk = m * n * k
         if mnk <= 824_633_720_832:
             return self.FUSER_EAGER_MEMCPY
