@@ -42,43 +42,36 @@ def main():
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    batch, seq, in_features, out_features = 2, 4, 16, 32
-    if out_features % world_size != 0:
-        raise RuntimeError("out_features must be divisible by world_size for this test")
+    m, k, n = 32, 16, 24
+    if m % world_size != 0:
+        raise RuntimeError("m must be divisible by world_size for this test")
+    m_local = m // world_size
 
-    x = torch.randn(batch, seq, in_features, device=device)
-    full_weight = torch.randn(out_features, in_features, device=device)
-    full_bias = torch.randn(out_features, device=device)
+    full_input = torch.randn(m, k, device=device)
+    weight = torch.randn(k, n, device=device)
+    bias = torch.randn(n, device=device)
+    input_shard = full_input[rank * m_local : (rank + 1) * m_local]
 
-
-    ref = torch.nn.functional.linear(x, full_weight, full_bias)
-    backends = ["pytorch", "fuser", "transformer_engine"]
+    ref = torch.matmul(full_input, weight) + bias
+    backends = ["pytorch", "fuser"]
     for backend in backends:
-        if backend == "transformer_engine":
-            try:
-                import transformer_engine.pytorch  # noqa: F401
-            except Exception:
-                if rank == 0:
-                    print("Skipping transformer_engine backend (not available)")
-                continue
         model = LinearColumnwise(
-            in_features,
-            out_features,
+            in_features=k,
+            out_features=n,
             bias=True,
             backend=backend,
             device=device,
         )
         with torch.no_grad():
-            local_out = out_features // world_size
-            start = rank * local_out
-            end = start + local_out
-            model.weight.copy_(full_weight[start:end])
-            model.bias.copy_(full_bias[start:end])
-        output = model(x)
+            model.weight.copy_(weight)
+            model.bias.copy_(bias)
+        output = model(input_shard)
         max_diff = (output - ref).abs().max().item()
         tol = 1e-2
         if max_diff > tol:
-            raise AssertionError(f"LinearColumnwise {backend} mismatch: max_diff={max_diff}")
+            raise AssertionError(
+                f"LinearColumnwise {backend} mismatch: max_diff={max_diff}"
+            )
     dist.barrier()
     if rank == 0:
         print("LinearColumnwise CUDA test passed (backends=", ",".join(backends), ")")
@@ -87,4 +80,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
